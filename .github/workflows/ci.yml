@@ -1,0 +1,228 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    types: [ opened, synchronize, reopened ]
+    branches:
+      - main
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+jobs:
+  test:
+    name: test ${{ matrix.rust }} ${{ matrix.flags }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [ "stable", "beta", "nightly" ] # MSRV
+        flags: [ "--no-default-features", "", "--all-features" ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ssh-key: ${{ secrets.CI_CARGO_PRIVATE_KEY }}
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Enable SSH Agent for Botlock to access Cargo
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.CI_CARGO_PRIVATE_KEY }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      # Only run test on the latest stable and above
+      - name: test
+        if: ${{ matrix.rust != '1.65' }} # MSRV
+        run: cargo test --workspace ${{ matrix.flags }} --release
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    env:
+      LLVMCOV_VERSION: 0.5.14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ssh-key: ${{ secrets.CI_CARGO_PRIVATE_KEY }}
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Enable SSH Agent for Botlock to access Cargo
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.CI_CARGO_PRIVATE_KEY }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          override: true
+          profile: minimal
+          components: clippy, rustfmt
+
+      - name: Cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-cache-hyper-server-coverage-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ env.LLVMCOV_VERSION }}
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version=${{ env.LLVMCOV_VERSION }} --locked
+
+      - name: Generate code coverage
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }} # not required for public repos
+          files: lcov.info
+          fail_ci_if_error: false
+
+  # TODO(Miri presently has errors/detects undefined behavior in the codebase)
+  # We should fix this and then enable.
+  #  miri:
+  #    name: miri ${{ matrix.flags }}
+  #    runs-on: ubuntu-latest
+  #    timeout-minutes: 30
+  #    strategy:
+  #      fail-fast: false
+  #      matrix:
+  #        flags: [ "--no-default-features", "", "--all-features" ]
+  #    env:
+  #      MIRIFLAGS: -Zmiri-strict-provenance
+  #    steps:
+  #      - uses: actions/checkout@v4
+  #      - uses: dtolnay/rust-toolchain@miri
+  #      - uses: Swatinem/rust-cache@v2
+  #        with:
+  #          cache-on-failure: true
+  #      - run: cargo miri setup ${{ matrix.flags }}
+  #      - run: cargo miri test ${{ matrix.flags }}
+
+  feature-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ssh-key: ${{ secrets.CI_CARGO_PRIVATE_KEY }}
+      - name: Enable SSH Agent for Botlock to access Cargo
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.CI_CARGO_PRIVATE_KEY }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-hack
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: cargo hack
+        run: cargo hack check --feature-powerset --depth 2
+
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ssh-key: ${{ secrets.CI_CARGO_PRIVATE_KEY }}
+      - name: Enable SSH Agent for Botlock to access Cargo
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.CI_CARGO_PRIVATE_KEY }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo clippy --workspace --all-targets --all-features
+        env:
+          RUSTFLAGS: -Dwarnings
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ssh-key: ${{ secrets.CI_CARGO_PRIVATE_KEY }}
+      - name: Enable SSH Agent for Botlock to access Cargo
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.CI_CARGO_PRIVATE_KEY }}
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo doc --workspace --all-features --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: "--cfg docsrs -D warnings"
+
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ssh-key: ${{ secrets.CI_CARGO_PRIVATE_KEY }}
+      - name: Enable SSH Agent for Botlock to access Cargo
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.CI_CARGO_PRIVATE_KEY }}
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+#  build-and-push-containers-to-ghcr:
+#    name: Build Docker Containers and Push to GHCR
+#    needs: test
+#    # Only run if the push is a tag, and the base ref is 'refs/heads/master'
+#    if: startsWith(github.ref, 'refs/tags/')
+#    runs-on: ubuntu-latest
+#    steps:
+#      - name: Check out code
+#        uses: actions/checkout@v4
+#        with:
+#          submodules: 'recursive'
+#          ssh-key: ${{ secrets.CI_CARGO_PRIVATE_KEY }}
+#
+#      - name: Set up Docker Buildx
+#        id: buildx
+#        uses: docker/setup-buildx-action@v1
+#
+#      - name: Login to GitHub Container Registry
+#        uses: docker/login-action@v3
+#        with:
+#          registry: ghcr.io
+#          username: ${{ github.actor }}
+#          password: ${{ secrets.GITHUB_TOKEN }}
+#
+#      - name: Build base level container
+#        env:
+#          DOCKERFILE: docker/api/base.dockerfile
+#        run: |
+#          DOCKER_BUILDKIT=1 docker buildx build --platform linux/amd64 -f docker/builder.dockerfile --target=builder -t ghcr.io/warlock-labs/arcana_node-builder:latest -t ghcr.io/warlock-labs/arcana_node-builder:$GITHUB_SHA --push .
+#
+#      - name: Build, Tag, and Push arcana_node image
+#        run: |
+#          DOCKER_BUILDKIT=1 docker buildx build --platform linux/amd64 -f docker/server.dockerfile -t ghcr.io/warlock-labs/arcana_node:latest -t ghcr.io/warlock-labs/arcana_node:$GITHUB_SHA --push --build-arg BUILDER_IMAGE=ghcr.io/warlock-labs/arcana_node-builder:$GITHUB_SHA .
+#
+#
