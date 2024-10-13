@@ -11,7 +11,7 @@ nanosecond-level latencies matter and contention in highly parallel systems is a
 
 - **AtomicSemaphore**: An extremely low-latency semaphore optimized for high-contention scenarios, particularly useful
   in nested parallelism contexts.
-- Designed to manage congestion in graph traversal algorithms with high-degree nodes.
+- Designed to manage congestion in parallel data structure updates. 
 - Optimized for scenarios involving frequent updates to shared data structures.
 
 ## Use Cases
