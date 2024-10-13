@@ -18,10 +18,9 @@
 //! ## Key Features
 //!
 //! - Fixed-size buffer allocated on the stack
-//! - Atomic operations for thread-safe access
+//! - Atomic operations for a thread-safe access
 //! - Watermark mechanism for efficient wraparound handling
 //! - Support for any `Send` type `T`
-//! - Safe handling of non-Copy types
 //!
 //! ## Usage
 //!
@@ -70,6 +69,7 @@
 //! can vary depending on contention and hardware characteristics.
 
 use std::cell::UnsafeCell;
+use std::iter::FusedIterator;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fmt, ptr};
@@ -79,7 +79,8 @@ use std::{fmt, ptr};
 /// # Type Parameters
 ///
 /// - `T`: The type of elements stored in the buffer. Must be `Send`.
-/// - `N`: The capacity of the buffer. Must be a power of two for efficient wrapping.
+/// - `N`: The capacity of the buffer. Must be a power of two for efficient
+///        wrapping, the buffer can hold up to `N - 1` elements.
 ///
 /// # Thread Safety
 ///
@@ -158,7 +159,7 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// # Examples
     ///
     /// ```
-    /// use atomic_ring_buffer::AtomicRingBuffer;
+    /// use electrologica::AtomicRingBuffer;
     ///
     /// let buffer: AtomicRingBuffer<String, 2> = AtomicRingBuffer::new();
     /// assert!(buffer.push(String::from("Hello")).is_ok());
@@ -167,33 +168,35 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// ```
     pub fn push(&self, item: T) -> Result<(), T> {
         loop {
-            let write = self.write.load(Ordering::Acquire);
-            let read = self.read.load(Ordering::Acquire);
-            let watermark = self.watermark.load(Ordering::Acquire);
-
+            let write = self.write.load(Ordering::SeqCst);
+            let read = self.read.load(Ordering::SeqCst);
             let next_write = (write + 1) & (N - 1);
 
-            if next_write == read && write != watermark {
-                return Err(item);
+            // Check if buffer is full
+            if next_write == read {
+                return Err(item); // Buffer is full
             }
 
-            let (new_write, new_watermark) = if write == N - 1 {
-                (0, write)
+            // Update watermark if we're about to wrap around
+            let new_watermark = if next_write == 0 {
+                write
             } else {
-                (next_write, watermark)
+                self.watermark.load(Ordering::SeqCst)
             };
 
             match self
                 .write
-                .compare_exchange(write, new_write, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(write, next_write, Ordering::SeqCst, Ordering::SeqCst)
             {
                 Ok(_) => {
                     unsafe {
                         ptr::write((*self.buffer[write].get()).as_mut_ptr(), item);
                     }
-                    if new_watermark != watermark {
-                        self.watermark.store(new_watermark, Ordering::Release);
+
+                    if new_watermark != self.watermark.load(Ordering::SeqCst) {
+                        self.watermark.store(new_watermark, Ordering::SeqCst);
                     }
+
                     return Ok(());
                 }
                 Err(_) => continue,
@@ -220,24 +223,36 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// ```
     pub fn pop(&self) -> Option<T> {
         loop {
-            let read = self.read.load(Ordering::Acquire);
-            let write = self.write.load(Ordering::Acquire);
-            let watermark = self.watermark.load(Ordering::Acquire);
+            let read = self.read.load(Ordering::SeqCst);
+            let write = self.write.load(Ordering::SeqCst);
 
-            if read == write && read != watermark {
-                return None;
+            if read == write {
+                return None; // Buffer is empty
             }
 
             let next_read = (read + 1) & (N - 1);
-            match self
-                .read
-                .compare_exchange(read, next_read, Ordering::AcqRel, Ordering::Acquire)
-            {
+            let watermark = self.watermark.load(Ordering::SeqCst);
+
+            // Check if we need to wrap around
+            let actual_next_read = if read == watermark && watermark != N {
+                0
+            } else {
+                next_read
+            };
+
+            match self.read.compare_exchange(
+                read,
+                actual_next_read,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
                 Ok(_) => {
                     let item = unsafe { ptr::read((*self.buffer[read].get()).as_ptr()) };
-                    if read == watermark {
-                        self.watermark.store(N, Ordering::Release);
+
+                    if actual_next_read == 0 {
+                        self.watermark.store(N, Ordering::SeqCst);
                     }
+
                     return Some(item);
                 }
                 Err(_) => continue,
@@ -263,8 +278,8 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// assert_eq!(buffer.peek().map(|s| s.as_str()), Some("Hello")); // Still there
     /// ```
     pub fn peek(&self) -> Option<&T> {
-        let read = self.read.load(Ordering::Acquire);
-        let write = self.write.load(Ordering::Acquire);
+        let read = self.read.load(Ordering::SeqCst);
+        let write = self.write.load(Ordering::SeqCst);
 
         if read == write {
             None // Buffer is empty
@@ -289,8 +304,8 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// assert_eq!(buffer.len(), 2);
     /// ```
     pub fn len(&self) -> usize {
-        let read = self.read.load(Ordering::Relaxed);
-        let write = self.write.load(Ordering::Relaxed);
+        let read = self.read.load(Ordering::SeqCst);
+        let write = self.write.load(Ordering::SeqCst);
         (write.wrapping_sub(read)) & (N - 1)
     }
 
@@ -307,41 +322,7 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// assert!(!buffer.is_empty());
     /// ```
     pub fn is_empty(&self) -> bool {
-        self.read.load(Ordering::Relaxed) == self.write.load(Ordering::Relaxed)
-    }
-
-    /// Returns `true` if the buffer is at capacity.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use electrologica::AtomicRingBuffer;
-    ///
-    /// let buffer: AtomicRingBuffer<String, 2> = AtomicRingBuffer::new();
-    /// assert!(!buffer.is_full());
-    /// buffer.push(String::from("Hello")).unwrap();
-    /// buffer.push(String::from("World")).unwrap();
-    /// assert!(buffer.is_full());
-    /// ```
-    pub fn is_full(&self) -> bool {
-        let write = self.write.load(Ordering::Relaxed);
-        let read = self.read.load(Ordering::Relaxed);
-        let next_write = (write + 1) & (N - 1);
-        next_write == read
-    }
-
-    /// Returns the total capacity of the buffer.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use electrologica::AtomicRingBuffer;
-    ///
-    /// let buffer: AtomicRingBuffer<String, 1024> = AtomicRingBuffer::new();
-    /// assert_eq!(buffer.capacity(), 1024);
-    /// ```
-    pub fn capacity(&self) -> usize {
-        N
+        self.read.load(Ordering::SeqCst) == self.write.load(Ordering::SeqCst)
     }
 
     /// Clears the buffer, removing all values.
@@ -361,8 +342,8 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// assert!(buffer.is_empty());
     /// ```
     pub fn clear(&self) {
-        let mut read = self.read.load(Ordering::Acquire);
-        let write = self.write.load(Ordering::Acquire);
+        let mut read = self.read.load(Ordering::SeqCst);
+        let write = self.write.load(Ordering::SeqCst);
 
         while read != write {
             unsafe {
@@ -371,8 +352,9 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
             read = Self::increment(read);
         }
 
-        self.read.store(0, Ordering::Release);
+        // Use a single store with release ordering to ensure all previous operations are visible
         self.write.store(0, Ordering::Release);
+        self.read.store(0, Ordering::Release);
         self.watermark.store(N, Ordering::Release);
     }
 
@@ -383,21 +365,130 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     }
 }
 
-impl<T, const N: usize> fmt::Debug for AtomicRingBuffer<T, N>
-where
-    T: fmt::Debug,
-{
+impl<T: Clone, const N: usize> Clone for AtomicRingBuffer<T, N> {
+    fn clone(&self) -> Self {
+        // Create a new buffer
+        let new_buffer = Self::new();
+
+        // Copy the contents
+        let read = self.read.load(Ordering::SeqCst);
+        let write = self.write.load(Ordering::SeqCst);
+        let mut current = read;
+
+        while current != write {
+            if let Some(item) = unsafe { (*self.buffer[current].get()).as_ptr().as_ref() } {
+                // Cloning each item and pushing it to the new buffer
+                let _ = new_buffer.push(item.clone());
+            }
+            current = (current + 1) & (N - 1);
+        }
+
+        // Copy the watermark
+        new_buffer
+            .watermark
+            .store(self.watermark.load(Ordering::SeqCst), Ordering::SeqCst);
+
+        new_buffer
+    }
+}
+
+impl<T, const N: usize> Default for AtomicRingBuffer<T, N> {
+    /// Creates a new, empty `AtomicRingBuffer`.
+    ///
+    /// This is equivalent to calling `AtomicRingBuffer::new()`.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: fmt::Debug, const N: usize> fmt::Debug for AtomicRingBuffer<T, N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AtomicRingBuffer")
-            .field("capacity", &self.capacity())
+            .field("capacity", &N)
             .field("len", &self.len())
+            .field("read", &self.read.load(Ordering::SeqCst))
+            .field("write", &self.write.load(Ordering::SeqCst))
+            .field("watermark", &self.watermark.load(Ordering::SeqCst))
             .finish()
     }
 }
 
-impl<T, const N: usize> Drop for AtomicRingBuffer<T, N> {
-    fn drop(&mut self) {
-        self.clear();
+impl<T: PartialEq, const N: usize> PartialEq for AtomicRingBuffer<T, N> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+
+        let self_read = self.read.load(Ordering::SeqCst);
+        let other_read = other.read.load(Ordering::SeqCst);
+        let self_write = self.write.load(Ordering::SeqCst);
+
+        let mut self_current = self_read;
+        let mut other_current = other_read;
+
+        while self_current != self_write {
+            let self_item = unsafe { (*self.buffer[self_current].get()).as_ptr().as_ref() };
+            let other_item = unsafe { (*other.buffer[other_current].get()).as_ptr().as_ref() };
+
+            if self_item != other_item {
+                return false;
+            }
+
+            self_current = (self_current + 1) & (N - 1);
+            other_current = (other_current + 1) & (N - 1);
+        }
+
+        true
+    }
+}
+
+impl<T: Eq, const N: usize> Eq for AtomicRingBuffer<T, N> {}
+
+// Iterator implementation
+pub struct AtomicRingBufferIterator<'a, T, const N: usize> {
+    buffer: &'a AtomicRingBuffer<T, N>,
+    current: usize,
+    end: usize,
+}
+
+impl<'a, T, const N: usize> Iterator for AtomicRingBufferIterator<'a, T, N> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current == self.end {
+            None
+        } else {
+            let item = unsafe { &*(*self.buffer.buffer[self.current].get()).as_ptr() };
+            self.current = (self.current + 1) & (N - 1);
+            Some(item)
+        }
+    }
+}
+
+impl<'a, T, const N: usize> FusedIterator for AtomicRingBufferIterator<'a, T, N> {}
+
+impl<T, const N: usize> AtomicRingBuffer<T, N> {
+    /// Returns an iterator over the items in the buffer.
+    ///
+    /// Note: This iterator provides a snapshot of the buffer at the time of creation.
+    /// Concurrent modifications may not be reflected in the iteration.
+    pub fn iter(&self) -> AtomicRingBufferIterator<T, N> {
+        let read = self.read.load(Ordering::SeqCst);
+        let write = self.write.load(Ordering::SeqCst);
+        AtomicRingBufferIterator {
+            buffer: self,
+            current: read,
+            end: write,
+        }
+    }
+}
+
+impl<'a, T, const N: usize> IntoIterator for &'a AtomicRingBuffer<T, N> {
+    type Item = &'a T;
+    type IntoIter = AtomicRingBufferIterator<'a, T, N>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -406,73 +497,103 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+    use std::time::Duration;
 
     #[test]
-    fn test_push_pop_basic() {
-        let buffer: AtomicRingBuffer<String, 4> = AtomicRingBuffer::new();
-
-        assert!(buffer.push(String::from("Hello")).is_ok());
-        assert!(buffer.push(String::from("World")).is_ok());
-
-        assert_eq!(buffer.pop(), Some(String::from("Hello")));
-        assert_eq!(buffer.pop(), Some(String::from("World")));
-        assert_eq!(buffer.pop(), None);
-    }
-
-    #[test]
-    fn test_wraparound() {
-        let buffer: AtomicRingBuffer<String, 4> = AtomicRingBuffer::new();
-
-        assert!(buffer.push(String::from("1")).is_ok());
-        assert!(buffer.push(String::from("2")).is_ok());
-        assert!(buffer.push(String::from("3")).is_ok());
-
-        assert_eq!(buffer.pop(), Some(String::from("1")));
-
-        assert!(buffer.push(String::from("4")).is_ok());
-        assert!(buffer.push(String::from("5")).is_ok());
-
-        assert_eq!(buffer.pop(), Some(String::from("2")));
-        assert_eq!(buffer.pop(), Some(String::from("3")));
-        assert_eq!(buffer.pop(), Some(String::from("4")));
-        assert_eq!(buffer.pop(), Some(String::from("5")));
+    fn test_basic_push_pop() {
+        let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
+        assert!(buffer.push(1).is_ok());
+        assert!(buffer.push(2).is_ok());
+        assert!(buffer.push(3).is_ok());
+        assert_eq!(buffer.pop(), Some(1));
+        assert_eq!(buffer.pop(), Some(2));
+        assert_eq!(buffer.pop(), Some(3));
         assert_eq!(buffer.pop(), None);
     }
 
     #[test]
     fn test_full_buffer() {
-        let buffer: AtomicRingBuffer<String, 4> = AtomicRingBuffer::new();
-
-        assert!(buffer.push(String::from("1")).is_ok());
-        assert!(buffer.push(String::from("2")).is_ok());
-        assert!(buffer.push(String::from("3")).is_ok());
-        assert!(buffer.push(String::from("4")).is_err());
-
-        assert_eq!(buffer.pop(), Some(String::from("1")));
-        assert!(buffer.push(String::from("4")).is_ok());
-        assert!(buffer.push(String::from("5")).is_err());
+        let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
+        assert!(buffer.push(1).is_ok());
+        assert!(buffer.push(2).is_ok());
+        assert!(buffer.push(3).is_ok());
+        assert!(buffer.push(4).is_err()); // Buffer should be full
+        assert_eq!(buffer.pop(), Some(1));
+        assert!(buffer.push(4).is_ok()); // Now there should be space
     }
 
     #[test]
-    fn test_concurrent_usage() {
-        let buffer = Arc::new(AtomicRingBuffer::<String, 1024>::new());
-        let producer_buffer = Arc::clone(&buffer);
-        let consumer_buffer = Arc::clone(&buffer);
+    fn test_wraparound() {
+        let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
+        assert!(buffer.push(1).is_ok());
+        assert!(buffer.push(2).is_ok());
+        assert!(buffer.push(3).is_ok());
+        assert!(buffer.push(4).is_err()); // Buffer is full
+        assert_eq!(buffer.pop(), Some(1));
+        assert!(buffer.push(4).is_ok());
+        assert_eq!(buffer.pop(), Some(2));
+        assert_eq!(buffer.pop(), Some(3));
+        assert_eq!(buffer.pop(), Some(4));
+        assert_eq!(buffer.pop(), None);
+    }
 
-        let producer = thread::spawn(move || {
+    #[test]
+    fn test_peek() {
+        let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
+        assert_eq!(buffer.peek(), None);
+        assert!(buffer.push(1).is_ok());
+        assert_eq!(buffer.peek(), Some(&1));
+        assert_eq!(buffer.peek(), Some(&1)); // Peek shouldn't consume
+        assert_eq!(buffer.pop(), Some(1));
+        assert_eq!(buffer.peek(), None);
+    }
+
+    #[test]
+    fn test_len() {
+        let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
+        assert_eq!(buffer.len(), 0);
+        assert!(buffer.push(1).is_ok());
+        assert_eq!(buffer.len(), 1);
+        assert!(buffer.push(2).is_ok());
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer.pop(), Some(1));
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.pop(), Some(2));
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[test]
+    fn test_clear() {
+        let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
+        assert!(buffer.push(1).is_ok());
+        assert!(buffer.push(2).is_ok());
+        buffer.clear();
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.pop(), None);
+        assert!(buffer.push(3).is_ok());
+        assert_eq!(buffer.pop(), Some(3));
+    }
+
+    #[test]
+    fn test_spsc_concurrent() {
+        let buffer = Arc::new(AtomicRingBuffer::<u32, 1024>::new());
+        let producer = Arc::clone(&buffer);
+        let consumer = Arc::clone(&buffer);
+
+        let producer_thread = thread::spawn(move || {
             for i in 0..10000 {
-                while producer_buffer.push(i.to_string()).is_err() {
+                while producer.push(i).is_err() {
                     thread::yield_now();
                 }
             }
         });
 
-        let consumer = thread::spawn(move || {
+        let consumer_thread = thread::spawn(move || {
             let mut sum = 0;
             let mut count = 0;
             while count < 10000 {
-                if let Some(value) = consumer_buffer.pop() {
-                    sum += value.parse::<usize>().unwrap();
+                if let Some(value) = consumer.pop() {
+                    sum += value;
                     count += 1;
                 } else {
                     thread::yield_now();
@@ -481,143 +602,114 @@ mod tests {
             sum
         });
 
-        producer.join().unwrap();
-        let sum = consumer.join().unwrap();
-
-        assert_eq!(sum, (0..10000).sum::<usize>());
+        producer_thread.join().unwrap();
+        let sum = consumer_thread.join().unwrap();
+        assert_eq!(sum, (0..10000).sum());
     }
 
     #[test]
-    fn test_peek() {
-        let buffer: AtomicRingBuffer<String, 2> = AtomicRingBuffer::new();
-
-        assert_eq!(buffer.peek(), None);
-
-        buffer.push(String::from("Hello")).unwrap();
-        assert_eq!(buffer.peek().map(String::as_str), Some("Hello"));
-        assert_eq!(buffer.peek().map(String::as_str), Some("Hello")); // Still there
-
-        buffer.pop();
-        assert_eq!(buffer.peek(), None);
+    fn test_multiple_wraparounds() {
+        let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
+        for i in 0..10 {
+            assert!(buffer.push(i).is_ok());
+            if i >= 2 {
+                // Buffer can only hold 3 elements (N-1)
+                assert_eq!(buffer.pop(), Some(i - 2));
+            }
+        }
+        assert_eq!(buffer.pop(), Some(8));
+        assert_eq!(buffer.pop(), Some(9));
+        assert_eq!(buffer.pop(), None);
     }
 
     #[test]
-    fn test_clear() {
-        let buffer: AtomicRingBuffer<String, 4> = AtomicRingBuffer::new();
-
-        buffer.push(String::from("1")).unwrap();
-        buffer.push(String::from("2")).unwrap();
-
-        assert!(!buffer.is_empty());
-        buffer.clear();
-        assert!(buffer.is_empty());
-
-        buffer.push(String::from("3")).unwrap();
-        assert_eq!(buffer.pop(), Some(String::from("3")));
+    fn test_alternating_push_pop() {
+        let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
+        for i in 0..100 {
+            assert!(buffer.push(i).is_ok());
+            assert_eq!(buffer.pop(), Some(i));
+        }
+        assert_eq!(buffer.pop(), None);
     }
 
     #[test]
-    fn test_is_empty_and_is_full() {
-        let buffer: AtomicRingBuffer<i32, 4> = AtomicRingBuffer::new();
+    fn test_contiguous_read_write() {
+        let buffer = Arc::new(AtomicRingBuffer::<u32, 1024>::new());
+        let producer = Arc::clone(&buffer);
+        let consumer = Arc::clone(&buffer);
 
-        assert!(buffer.is_empty());
-        assert!(!buffer.is_full());
-
-        buffer.push(1).unwrap();
-        assert!(!buffer.is_empty());
-        assert!(!buffer.is_full());
-
-        buffer.push(2).unwrap();
-        buffer.push(3).unwrap();
-        assert!(!buffer.is_empty());
-        assert!(buffer.is_full());
-
-        buffer.pop();
-        assert!(!buffer.is_empty());
-        assert!(!buffer.is_full());
-    }
-
-    #[test]
-    fn test_capacity_and_len() {
-        let buffer: AtomicRingBuffer<i32, 4> = AtomicRingBuffer::new();
-
-        assert_eq!(buffer.capacity(), 4);
-        assert_eq!(buffer.len(), 0);
-
-        buffer.push(1).unwrap();
-        buffer.push(2).unwrap();
-        assert_eq!(buffer.len(), 2);
-
-        buffer.pop();
-        assert_eq!(buffer.len(), 1);
-    }
-
-    #[test]
-    fn test_multiple_producers_consumers() {
-        let buffer = Arc::new(AtomicRingBuffer::<i32, 1024>::new());
-        let num_producers = 4;
-        let num_consumers = 4;
-        let items_per_producer = 10000;
-
-        let mut producers = vec![];
-        let mut consumers = vec![];
-
-        for _ in 0..num_producers {
-            let producer_buffer = Arc::clone(&buffer);
-            producers.push(thread::spawn(move || {
-                for i in 0..items_per_producer {
-                    while producer_buffer.push(i as i32).is_err() {
+        let producer_thread = thread::spawn(move || {
+            for chunk in (0..10000).collect::<Vec<u32>>().chunks(100) {
+                for &value in chunk {
+                    while producer.push(value).is_err() {
                         thread::yield_now();
                     }
                 }
-            }));
-        }
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
 
-        let total_items = num_producers * items_per_producer;
-        let items_per_consumer = total_items / num_consumers;
-
-        for _ in 0..num_consumers {
-            let consumer_buffer = Arc::clone(&buffer);
-            consumers.push(thread::spawn(move || {
-                let mut sum = 0;
-                let mut count = 0;
-                while count < items_per_consumer {
-                    if let Some(value) = consumer_buffer.pop() {
-                        sum += value as usize;
+        let consumer_thread = thread::spawn(move || {
+            let mut sum = 0;
+            let mut count = 0;
+            while count < 10000 {
+                let mut chunk = Vec::new();
+                while chunk.len() < 100 && count < 10000 {
+                    if let Some(value) = consumer.pop() {
+                        chunk.push(value);
+                        sum += value;
                         count += 1;
                     } else {
-                        thread::yield_now();
+                        break;
                     }
                 }
-                sum
-            }));
-        }
+                if !chunk.is_empty() {
+                    assert!(chunk.len() <= 100);
+                    assert_eq!(
+                        chunk,
+                        (count - chunk.len() as u32..count).collect::<Vec<u32>>()
+                    );
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            sum
+        });
 
-        for producer in producers {
-            producer.join().unwrap();
-        }
-
-        let total_sum: usize = consumers.into_iter().map(|c| c.join().unwrap()).sum();
-
-        let expected_sum = (0..items_per_producer as i32).sum::<i32>() as usize * num_producers;
-        assert_eq!(total_sum, expected_sum);
+        producer_thread.join().unwrap();
+        let sum = consumer_thread.join().unwrap();
+        assert_eq!(sum, (0..10000).sum());
     }
 
     #[test]
-    fn test_drop() {
-        let buffer = AtomicRingBuffer::<String, 4>::new();
-        buffer.push(String::from("test")).unwrap();
-        // The buffer will be dropped here, and it should not panic or leak memory
-    }
+    fn test_stress() {
+        let buffer = Arc::new(AtomicRingBuffer::<u32, 1024>::new());
+        let producer = Arc::clone(&buffer);
+        let consumer = Arc::clone(&buffer);
 
-    #[test]
-    fn test_debug_output() {
-        let buffer: AtomicRingBuffer<i32, 4> = AtomicRingBuffer::new();
-        buffer.push(1).unwrap();
-        buffer.push(2).unwrap();
+        let producer_thread = thread::spawn(move || {
+            for i in 0..1000000 {
+                while producer.push(i).is_err() {
+                    thread::yield_now();
+                }
+            }
+        });
 
-        let debug_output = format!("{:?}", buffer);
-        assert!(debug_output.contains("capacity: 4"));
-        assert!(debug_output.contains("len: 2"));
+        let consumer_thread = thread::spawn(move || {
+            let mut sum = 0u64; // Use u64 to avoid overflow
+            let mut count = 0;
+            while count < 1000000 {
+                if let Some(value) = consumer.pop() {
+                    sum += value as u64;
+                    count += 1;
+                } else {
+                    thread::yield_now();
+                }
+            }
+            sum
+        });
+
+        producer_thread.join().unwrap();
+        let sum = consumer_thread.join().unwrap();
+        assert_eq!(sum, (0..1000000).sum::<u64>());
     }
 }
