@@ -167,13 +167,12 @@ use std::mem::{needs_drop, MaybeUninit};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fmt, ptr};
 
+use crate::spin::{spin_try, SpinConfig, SpinError};
 use crossbeam_utils::CachePadded;
 #[cfg(feature = "rayon")]
 use rayon::iter::plumbing::{bridge, Consumer, Producer, ProducerCallback, UnindexedConsumer};
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
-
-use crate::spin::spin_try;
 
 /// A lock-free, single-producer single-consumer ring buffer with support for contiguous writes.
 ///
@@ -373,38 +372,86 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// # Returns
     ///
     /// Returns `Ok(())` if the item was successfully pushed, or `Err(T)` if the operation timed out.
-    pub fn push(&self, item: T) -> Result<(), T> {
-        let item_cell = RefCell::new(Some(item));
-        match spin_try(|| {
-            let mut item_ref = item_cell.borrow_mut();
-            if let Some(current_item) = item_ref.take() {
-                match self.try_push(current_item) {
-                    Ok(()) => Some(()),
-                    Err(returned_item) => {
-                        *item_ref = Some(returned_item);
-                        None
-                    }
-                }
-            } else {
-                // This shouldn't happen, but we'll return Some(()) to break the spin loop
-                Some(())
-            }
-        }) {
-            Some(()) => Ok(()),
-            None => Err(item_cell.into_inner().unwrap()),
-        }
-    }
-
-    /// Pops an item from the ring buffer, using a spinning strategy to handle contention.
+    /// Attempts to push an item into the ring buffer, retrying with a spin-wait strategy if the buffer is temporarily full.
     ///
-    /// This function will attempt to pop an item multiple times, using an escalating
-    /// strategy of spinning, yielding, and parking to reduce contention and CPU usage.
+    /// This method will keep trying to push the item using `try_push` until it succeeds or the spin-wait strategy times out.
+    ///
+    /// # Arguments
+    ///
+    /// * `item` - The item to push into the buffer.
     ///
     /// # Returns
     ///
-    /// Returns `Some(T)` if an item was successfully popped, or `None` if the operation timed out.
+    /// * `Ok(())` if the item was successfully pushed into the buffer.
+    /// * `Err(T)` if the buffer remains full after all retry attempts, returning the original item.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use electrologica::AtomicRingBuffer;
+    /// let buffer: AtomicRingBuffer<u64, 2> = AtomicRingBuffer::new();
+    /// match buffer.push(42) {
+    ///     Ok(()) => println!("Item pushed successfully"),
+    ///     Err(item) => println!("Failed to push item: {}", item),
+    /// }
+    /// ```
+    pub fn push(&self, item: T) -> Result<(), T> {
+        let item_cell = RefCell::new(Some(item));
+        match spin_try(
+            || {
+                let mut item_ref = item_cell.borrow_mut();
+                if let Some(current_item) = item_ref.take() {
+                    match self.try_push(current_item) {
+                        Ok(()) => Some(()),
+                        Err(returned_item) => {
+                            *item_ref = Some(returned_item);
+                            None
+                        }
+                    }
+                } else {
+                    // This shouldn't happen, but we'll return Some(()) to break the spin loop
+                    Some(())
+                }
+            },
+            SpinConfig::default(),
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) => match e {
+                SpinError::MaxBackoffReached | SpinError::Timeout => {
+                    // If we've reached max backoff or timed out, return the original item as an error
+                    Err(item_cell.into_inner().unwrap())
+                }
+            },
+        }
+    }
+
+    /// Attempts to pop an item from the ring buffer, retrying with a spin-wait strategy if the buffer is temporarily empty.
+    ///
+    /// This method will keep trying to pop an item using `try_pop` until it succeeds or the spin-wait strategy times out.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(T)` if an item was successfully popped from the buffer.
+    /// * `None` if the buffer remains empty after all retry attempts.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use electrologica::AtomicRingBuffer;
+    /// let buffer: AtomicRingBuffer<u64, 2> = AtomicRingBuffer::new();
+    ///
+    /// buffer.try_push(42).unwrap();
+    /// match buffer.pop() {
+    ///     Some(item) => println!("Popped item: {:?}", item),
+    ///     None => println!("Buffer is empty"),
+    /// }
+    /// ```
     pub fn pop(&self) -> Option<T> {
-        spin_try(|| self.try_pop())
+        match spin_try(|| self.try_pop(), SpinConfig::default()) {
+            Ok(item) => Some(item),
+            Err(SpinError::MaxBackoffReached) => None,
+            Err(SpinError::Timeout) => None,
+        }
     }
 
     /// Attempts to pop an element from the buffer.
