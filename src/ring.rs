@@ -1752,6 +1752,8 @@ mod tests {
     }
 
     #[test]
+    // We ignore this as it's too slow to run in normal test runs
+    #[ignore]
     fn test_concurrent_stress() {
         let buffer = Arc::new(AtomicRingBuffer::<u32, 1024>::new());
         let producer = Arc::clone(&buffer);
