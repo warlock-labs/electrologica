@@ -1,6 +1,6 @@
 [package]
 name = "electrologica"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["0xAlcibiades <alcibiades@warlock.xyz"]
 homepage = "https://github.com/warlock-labs/electrologica"
