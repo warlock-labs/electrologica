@@ -1,16 +1,5 @@
-use std::hint::spin_loop;
+use crate::spin::spin_try;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
-
-/// Constants for fine-tuning the semaphore behavior
-const SPIN_TRIES: u32 = 5;
-const YIELD_TRIES: u32 = 10;
-const PARK_TRIES: u32 = 15;
-const INITIAL_BACKOFF_NANOS: u64 = 10;
-const MAX_BACKOFF: Duration = Duration::from_micros(100);
-const BACKOFF_FACTOR: u64 = 2;
-const ACQUIRE_TIMEOUT: Duration = Duration::from_micros(100000);
 
 /// A high-performance, atomic semaphore optimized for extremely low latency.
 ///
@@ -81,33 +70,7 @@ impl AtomicSemaphore {
     /// assert!(!sem.acquire()); // This will time out
     /// ```
     pub fn acquire(&self) -> bool {
-        let start = Instant::now();
-        let mut spins = 0;
-        let mut yields = 0;
-        let mut parks = 0;
-
-        while start.elapsed() < ACQUIRE_TIMEOUT {
-            if self.try_acquire() {
-                return true;
-            }
-
-            if spins < SPIN_TRIES {
-                spins += 1;
-                spin_loop();
-            } else if yields < YIELD_TRIES {
-                yields += 1;
-                thread::yield_now();
-            } else if parks < PARK_TRIES {
-                parks += 1;
-                let backoff_nanos = INITIAL_BACKOFF_NANOS * BACKOFF_FACTOR.pow(parks);
-                let backoff = Duration::from_nanos(backoff_nanos);
-                thread::park_timeout(backoff.min(MAX_BACKOFF));
-            } else {
-                thread::park_timeout(MAX_BACKOFF);
-            }
-        }
-
-        false
+        spin_try(|| if self.try_acquire() { Some(()) } else { None }).is_some()
     }
 
     /// Attempts to acquire a permit without blocking.
@@ -205,7 +168,7 @@ pub struct SemaphoreGuard<'a> {
     semaphore: &'a AtomicSemaphore,
 }
 
-impl<'a> Drop for SemaphoreGuard<'a> {
+impl Drop for SemaphoreGuard<'_> {
     fn drop(&mut self) {
         self.semaphore.release();
     }
@@ -245,16 +208,19 @@ impl AtomicSemaphore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use once_cell::sync::Lazy;
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
     use std::thread;
+    use std::time::Instant;
+
+    use once_cell::sync::Lazy;
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     use tracing::info;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::{fmt, EnvFilter};
+
+    use super::*;
 
     pub static TRACING: Lazy<()> = Lazy::new(|| {
         let fmt_layer = fmt::layer()
@@ -431,6 +397,6 @@ mod tests {
         assert!(sem.acquire());
         let start = Instant::now();
         assert!(!sem.acquire());
-        assert!(start.elapsed() >= ACQUIRE_TIMEOUT);
+        assert!(start.elapsed() >= crate::spin::SPIN_TIMEOUT);
     }
 }
