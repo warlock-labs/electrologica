@@ -1159,7 +1159,7 @@ impl<'a, T, const N: usize> Iterator for AtomicRingBufferIterator<'a, T, N> {
 
 /// Implements FusedIterator for AtomicRingBufferIterator.
 /// This indicates that calling `next` after it has returned None will always return None.
-impl<'a, T, const N: usize> FusedIterator for AtomicRingBufferIterator<'a, T, N> {}
+impl<T, const N: usize> FusedIterator for AtomicRingBufferIterator<'_, T, N> {}
 
 impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// Returns an iterator over the items in the buffer.
@@ -1401,7 +1401,7 @@ pub struct Drain<'a, T, const N: usize> {
     buffer: &'a AtomicRingBuffer<T, N>,
 }
 
-impl<'a, T, const N: usize> Iterator for Drain<'a, T, N> {
+impl<T, const N: usize> Iterator for Drain<'_, T, N> {
     type Item = T;
 
     /// Removes and returns the next element from the buffer, or `None` if the buffer is empty.
@@ -1438,7 +1438,7 @@ impl<'a, T, const N: usize> Iterator for Drain<'a, T, N> {
 /// This indicates that calling `next` after it has returned `None` will always return `None`.
 /// It's automatically implemented because our `next` method delegates to `pop`,
 /// which has this property.
-impl<'a, T, const N: usize> FusedIterator for Drain<'a, T, N> {}
+impl<T, const N: usize> FusedIterator for Drain<'_, T, N> {}
 
 impl<T: Send + Sync, const N: usize> AtomicRingBuffer<T, N> {
     /// Performs a parallel drain operation on the buffer.

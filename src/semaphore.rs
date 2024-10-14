@@ -168,7 +168,7 @@ pub struct SemaphoreGuard<'a> {
     semaphore: &'a AtomicSemaphore,
 }
 
-impl<'a> Drop for SemaphoreGuard<'a> {
+impl Drop for SemaphoreGuard<'_> {
     fn drop(&mut self) {
         self.semaphore.release();
     }
