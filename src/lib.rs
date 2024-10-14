@@ -1,6 +1,6 @@
-mod ring;
-mod semaphore;
-
+pub use ring::AtomicRingBuffer;
 pub use semaphore::{AtomicSemaphore, SemaphoreGuard};
 
-pub use ring::AtomicRingBuffer;
+mod ring;
+mod semaphore;
+mod spin;

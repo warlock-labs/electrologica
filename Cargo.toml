@@ -44,8 +44,8 @@ approx = "0.5.1"
 
 [features]
 default = []
+dev-profiling = ["pprof"]
+jemalloc = ["tikv-jemallocator"]
 
 [package.metadata.docs.rs]
-rayon = ["dep:rayon"]
-dev-profiling = ["dep:pprof"]
-jemalloc = ["dep:tikv-jemallocator"]
+rayon = ["rayon"]

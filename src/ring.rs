@@ -89,13 +89,13 @@
 //! let buffer: AtomicRingBuffer<String, 1024> = AtomicRingBuffer::new();
 //!
 //! // Producer thread
-//! buffer.push(String::from("Hello")).unwrap();
-//! buffer.push(String::from("World")).unwrap();
+//! buffer.try_push(String::from("Hello")).unwrap();
+//! buffer.try_push(String::from("World")).unwrap();
 //!
 //! // Consumer thread
-//! assert_eq!(buffer.pop(), Some(String::from("Hello")));
-//! assert_eq!(buffer.pop(), Some(String::from("World")));
-//! assert_eq!(buffer.pop(), None);
+//! assert_eq!(buffer.try_pop(), Some(String::from("Hello")));
+//! assert_eq!(buffer.try_pop(), Some(String::from("World")));
+//! assert_eq!(buffer.try_pop(), None);
 //! ```
 //!
 //! Using the drain iterator:
@@ -104,8 +104,8 @@
 //! use electrologica::AtomicRingBuffer;
 //!
 //! let buffer: AtomicRingBuffer<i32, 4> = AtomicRingBuffer::new();
-//! buffer.push(1).unwrap();
-//! buffer.push(2).unwrap();
+//! buffer.try_push(1).unwrap();
+//! buffer.try_push(2).unwrap();
 //!
 //! let drained: Vec<i32> = buffer.drain().collect();
 //! assert_eq!(drained, vec![1, 2]);
@@ -160,13 +160,20 @@
 //! Users interested in the theoretical underpinnings of lock-free data structures are encouraged
 //! to explore these references.
 
-use crossbeam_utils::CachePadded;
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::fmt::Debug;
 use std::iter::FusedIterator;
 use std::mem::{needs_drop, MaybeUninit};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fmt, ptr};
+
+use crossbeam_utils::CachePadded;
+#[cfg(feature = "rayon")]
+use rayon::iter::plumbing::{bridge, Consumer, Producer, ProducerCallback, UnindexedConsumer};
+#[cfg(feature = "rayon")]
+use rayon::prelude::*;
+
+use crate::spin::spin_try;
 
 /// A lock-free, single-producer single-consumer ring buffer with support for contiguous writes.
 ///
@@ -268,72 +275,136 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// use electrologica::AtomicRingBuffer;
     ///
     /// let buffer: AtomicRingBuffer<String, 4> = AtomicRingBuffer::new();
-    /// assert!(buffer.push(String::from("Hello")).is_ok());
-    /// assert!(buffer.push(String::from("World")).is_ok());
-    /// assert!(buffer.push(String::from("!")).is_ok());
-    /// assert!(buffer.push(String::from("Goodbye")).is_err());
+    /// assert!(buffer.try_push(String::from("Hello")).is_ok());
+    /// assert!(buffer.try_push(String::from("World")).is_ok());
+    /// assert!(buffer.try_push(String::from("!")).is_ok());
+    /// assert!(buffer.try_push(String::from("Goodbye")).is_err());
     /// ```
     #[inline]
-    pub fn push(&self, item: T) -> Result<(), T> {
-        loop {
-            // Load the current write index with Acquire ordering.
-            // This ensures that we see the most up-to-date value and synchronizes with previous reads.
-            let write = self.write.load(Ordering::Acquire);
+    pub fn try_push(&self, item: T) -> Result<(), T> {
+        // Load the current write index with Acquire ordering.
+        let write = self.write.load(Ordering::Acquire);
 
-            // Calculate the next write position, wrapping around if necessary
-            let next_write = AtomicRingBuffer::<T, N>::increment(write);
+        // Calculate the next write position, wrapping around if necessary.
+        let next_write = Self::increment(write);
 
-            // Load the current read index with Acquire ordering.
-            // This ensures we see the latest reads from consumer threads.
-            let read = self.read.load(Ordering::Acquire);
+        // Load the current read index with Acquire ordering.
+        let read = self.read.load(Ordering::Acquire);
 
-            // Check if the buffer is full
-            if next_write == read {
-                return Err(item); // Buffer is full, return the item
-            }
+        // Check if the buffer is full.
+        if next_write == read {
+            return Err(item); // Buffer is full, return the item.
+        }
 
-            // Attempt to update the write index using compare_exchange_weak
-            match self.write.compare_exchange_weak(
-                write,
-                next_write,
-                Ordering::AcqRel, // Success: Acquire to sync with other threads, Release to make our update visible
-                Ordering::Acquire, // Failure: We still need to synchronize with other threads
-            ) {
-                Ok(_) => {
-                    // Successfully updated write index, now we can safely write the item
-                    // Safety: We know this index is valid because we've successfully claimed it
+        // Prepare the new watermark value.
+        let new_watermark = if next_write == 0 { write } else { N };
+
+        // Attempt to update both the write index and the watermark.
+        match self
+            .write
+            .compare_exchange(write, next_write, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                // The write index was successfully updated.
+                // Now, attempt to update the watermark if necessary.
+                if next_write == 0 {
+                    match self.watermark.compare_exchange(
+                        N,
+                        new_watermark,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            // Both write index and watermark were successfully updated.
+                            // Now it's safe to write the item.
+                            unsafe {
+                                ptr::write((*self.buffer[write].get()).as_mut_ptr(), item);
+                            }
+                            Ok(())
+                        }
+                        Err(_) => {
+                            // Watermark update failed. Revert the write index and return an error.
+                            let _ = self.write.compare_exchange(
+                                next_write,
+                                write,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
+                            Err(item)
+                        }
+                    }
+                } else {
+                    // No need to update the watermark.
+                    // It's safe to write the item.
                     unsafe {
                         ptr::write((*self.buffer[write].get()).as_mut_ptr(), item);
                     }
-
-                    // If we're about to wrap around, update the watermark
-                    if next_write == 0 {
-                        // Set the watermark to the current write position
-                        // Use compare_exchange to avoid unnecessary updates
-                        let _ = self.watermark.compare_exchange(
-                            N,
-                            write,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        );
-                    }
-
-                    // Optional: Prefetch the next write location for potential performance improvement
-                    // #[cfg(target_arch = "x86_64")]
-                    // unsafe {
-                    //     use std::arch::x86_64::_mm_prefetch;
-                    //     _mm_prefetch(self.buffer[next_write].get() as *const i8, _MM_HINT_T0);
-                    // }
-
-                    return Ok(());
-                }
-                Err(_) => {
-                    // The compare_exchange_weak failed, meaning another thread updated the write index
-                    // We'll retry the whole operation from the start of the loop
-                    continue;
+                    Ok(())
                 }
             }
+            Err(_) => {
+                // The write index update failed.
+                Err(item)
+            }
         }
+    }
+
+    /// Pushes an item into the ring buffer, using a spinning strategy to handle contention.
+    ///
+    /// This function will attempt to push the item multiple times, using an escalating
+    /// strategy of spinning, yielding, and parking to reduce contention and CPU usage.
+    ///
+    /// # Arguments
+    ///
+    /// * `item` - The item to be pushed into the buffer.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if the item was successfully pushed, or `Err(T)` if the operation timed out.
+    /// Pushes an item into the ring buffer, using a spinning strategy to handle contention.
+    ///
+    /// This function will attempt to push the item multiple times, using an escalating
+    /// strategy of spinning, yielding, and parking to reduce contention and CPU usage.
+    ///
+    /// # Arguments
+    ///
+    /// * `item` - The item to be pushed into the buffer.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if the item was successfully pushed, or `Err(T)` if the operation timed out.
+    pub fn push(&self, item: T) -> Result<(), T> {
+        let item_cell = RefCell::new(Some(item));
+        match spin_try(|| {
+            let mut item_ref = item_cell.borrow_mut();
+            if let Some(current_item) = item_ref.take() {
+                match self.try_push(current_item) {
+                    Ok(()) => Some(()),
+                    Err(returned_item) => {
+                        *item_ref = Some(returned_item);
+                        None
+                    }
+                }
+            } else {
+                // This shouldn't happen, but we'll return Some(()) to break the spin loop
+                Some(())
+            }
+        }) {
+            Some(()) => Ok(()),
+            None => Err(item_cell.into_inner().unwrap()),
+        }
+    }
+
+    /// Pops an item from the ring buffer, using a spinning strategy to handle contention.
+    ///
+    /// This function will attempt to pop an item multiple times, using an escalating
+    /// strategy of spinning, yielding, and parking to reduce contention and CPU usage.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(T)` if an item was successfully popped, or `None` if the operation timed out.
+    pub fn pop(&self) -> Option<T> {
+        spin_try(|| self.try_pop())
     }
 
     /// Attempts to pop an element from the buffer.
@@ -348,78 +419,79 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// use electrologica::AtomicRingBuffer;
     ///
     /// let buffer: AtomicRingBuffer<String, 2> = AtomicRingBuffer::new();
-    /// buffer.push(String::from("Hello")).unwrap();
+    /// buffer.try_push(String::from("Hello")).unwrap();
     ///
-    /// assert_eq!(buffer.pop(), Some(String::from("Hello")));
-    /// assert_eq!(buffer.pop(), None);
+    /// assert_eq!(buffer.try_pop(), Some(String::from("Hello")));
+    /// assert_eq!(buffer.try_pop(), None);
     /// ```
     #[inline]
-    pub fn pop(&self) -> Option<T> {
-        loop {
-            // Load the current read index with Acquire ordering.
-            // This ensures that we see the most up-to-date value and synchronizes with previous writes.
-            let read = self.read.load(Ordering::Acquire);
+    pub fn try_pop(&self) -> Option<T> {
+        // Load the current read index with Acquire ordering.
+        let read = self.read.load(Ordering::Acquire);
 
-            // Load the current write index with Acquire ordering.
-            // This ensures we see the latest writes to the buffer from producer threads.
-            let write = self.write.load(Ordering::Acquire);
+        // Load the current write index with Acquire ordering.
+        let write = self.write.load(Ordering::Acquire);
 
-            // Check if the buffer is empty
-            if read == write {
-                return None; // Buffer is empty, nothing to pop
-            }
+        // Check if the buffer is empty
+        if read == write {
+            return None; // Buffer is empty, nothing to pop
+        }
 
-            // Calculate the next read position, wrapping around if necessary
-            let next_read = AtomicRingBuffer::<T, N>::increment(read);
+        // Calculate the next read position, wrapping around if necessary
+        let next_read = Self::increment(read);
 
-            // Load the current watermark with Acquire ordering
-            // This is necessary to correctly handle wraparound conditions
-            let watermark = self.watermark.load(Ordering::Acquire);
+        // Load the current watermark with Acquire ordering
+        let watermark = self.watermark.load(Ordering::Acquire);
 
-            // Determine the actual next read position, handling wrap-around
-            let actual_next_read = if read == watermark && watermark != N {
-                0 // Wrap around to the beginning of the buffer
-            } else {
-                next_read
-            };
+        // Determine the actual next read position, handling wrap-around
+        let (actual_next_read, new_watermark) = if read == watermark && watermark != N {
+            (0, N) // Wrap around to the beginning of the buffer and reset watermark
+        } else {
+            (next_read, watermark) // No wrap-around, keep current watermark
+        };
 
-            // Attempt to update the read index using compare_exchange_weak
-            match self.read.compare_exchange_weak(
-                read,
-                actual_next_read,
-                Ordering::AcqRel, // Success: Acquire to sync with other threads, Release to make our update visible
-                Ordering::Acquire, // Failure: We still need to synchronize with other threads
-            ) {
-                Ok(_) => {
-                    // Successfully updated read index, now we can safely read the item
-                    // Safety: We know this index is valid because we've successfully claimed it
-                    let item = unsafe { ptr::read((*self.buffer[read].get()).as_ptr()) };
-
-                    if actual_next_read == 0 {
-                        // Reset the watermark to N, indicating no wraparound condition
-                        // Use compare_exchange to avoid unnecessary updates
-                        let _ = self.watermark.compare_exchange(
-                            watermark, // Expected value: the watermark we read earlier
-                            N,         // New value: reset to N
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        );
+        // Attempt to update the read index
+        match self.read.compare_exchange(
+            read,
+            actual_next_read,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // The read index was successfully updated.
+                // Now, attempt to update the watermark if necessary.
+                if actual_next_read == 0 {
+                    match self.watermark.compare_exchange(
+                        watermark,
+                        new_watermark,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            // Both read index and watermark were successfully updated.
+                            // Now it's safe to read the item.
+                            unsafe { Some(ptr::read((*self.buffer[read].get()).as_ptr())) }
+                        }
+                        Err(_) => {
+                            // Watermark update failed. Revert the read index and return None.
+                            let _ = self.read.compare_exchange(
+                                actual_next_read,
+                                read,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
+                            None
+                        }
                     }
-
-                    // Optional: Prefetch the next item for potential performance improvement
-                    // #[cfg(target_arch = "x86_64")]
-                    // unsafe {
-                    //     use std::arch::x86_64::_mm_prefetch;
-                    //     _mm_prefetch(self.buffer[actual_next_read].get() as *const i8, _MM_HINT_T0);
-                    // }
-
-                    return Some(item);
+                } else {
+                    // No need to update the watermark.
+                    // It's safe to read the item.
+                    unsafe { Some(ptr::read((*self.buffer[read].get()).as_ptr())) }
                 }
-                Err(_) => {
-                    // The compare_exchange_weak failed, meaning another thread updated the read index
-                    // We'll retry the whole operation from the start of the loop
-                    continue;
-                }
+            }
+            Err(_) => {
+                // The read index update failed.
+                None
             }
         }
     }
@@ -435,8 +507,8 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// use electrologica::AtomicRingBuffer;
     ///
     /// let buffer: AtomicRingBuffer<i32, 4> = AtomicRingBuffer::new();
-    /// buffer.push(1).unwrap();
-    /// buffer.push(2).unwrap();
+    /// buffer.try_push(1).unwrap();
+    /// buffer.try_push(2).unwrap();
     ///
     /// let drained: Vec<i32> = buffer.drain().collect();
     /// assert_eq!(drained, vec![1, 2]);
@@ -468,7 +540,7 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// use electrologica::AtomicRingBuffer;
     ///
     /// let buffer: AtomicRingBuffer<String, 2> = AtomicRingBuffer::new();
-    /// buffer.push(String::from("Hello")).unwrap();
+    /// buffer.try_push(String::from("Hello")).unwrap();
     ///
     /// assert_eq!(buffer.peek().map(|s| s.as_str()), Some("Hello"));
     /// assert_eq!(buffer.peek().map(|s| s.as_str()), Some("Hello")); // Still there
@@ -510,6 +582,7 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// # Safety
     ///
     /// The caller must ensure that the index is within the valid range of the buffer.
+    #[cfg(feature = "rayon")]
     unsafe fn peek_at(&self, index: usize) -> Option<&T> {
         let read = self.read.load(Ordering::Acquire);
         let write = self.write.load(Ordering::Acquire);
@@ -569,8 +642,8 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// use electrologica::AtomicRingBuffer;
     ///
     /// let buffer: AtomicRingBuffer<String, 4> = AtomicRingBuffer::new();
-    /// buffer.push(String::from("Hello")).unwrap();
-    /// buffer.push(String::from("World")).unwrap();
+    /// buffer.try_push(String::from("Hello")).unwrap();
+    /// buffer.try_push(String::from("World")).unwrap();
     /// assert_eq!(buffer.len(), 2);
     /// ```
     ///
@@ -633,7 +706,7 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     ///
     /// let buffer: AtomicRingBuffer<String, 4> = AtomicRingBuffer::new();
     /// assert!(buffer.is_empty());
-    /// buffer.push(String::from("Hello")).unwrap();
+    /// buffer.try_push(String::from("Hello")).unwrap();
     /// assert!(!buffer.is_empty());
     /// ```
     ///
@@ -751,7 +824,7 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     /// use electrologica::AtomicRingBuffer;
     ///
     /// let buffer: AtomicRingBuffer<String, 4> = AtomicRingBuffer::new();
-    /// buffer.push(String::from("Hello")).unwrap();
+    /// buffer.try_push(String::from("Hello")).unwrap();
     /// assert!(!buffer.is_empty());
     /// buffer.clear();
     /// assert!(buffer.is_empty());
@@ -817,7 +890,7 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     ///
     /// # Examples
     ///
-    /// ```norun
+    /// ```no run
     /// // Assuming N = 8 (buffer size)
     /// assert_eq!(increment(6), 7);  // Normal increment
     /// assert_eq!(increment(7), 0);  // Wrap around to the beginning
@@ -1118,11 +1191,6 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
         }
     }
 }
-
-#[cfg(feature = "rayon")]
-use rayon::iter::plumbing::{bridge, Consumer, Producer, ProducerCallback, UnindexedConsumer};
-#[cfg(feature = "rayon")]
-use rayon::prelude::*;
 
 impl<T: Send + Sync, const N: usize> AtomicRingBuffer<T, N> {
     /// Returns a parallel iterator over the buffer.
@@ -1529,57 +1597,58 @@ impl<'a, T: Send, const N: usize> DoubleEndedIterator for ParDrainIter<'a, T, N>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
+    use super::*;
+
     #[test]
     fn test_basic_push_pop() {
         let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
-        assert!(buffer.push(1).is_ok());
-        assert!(buffer.push(2).is_ok());
-        assert!(buffer.push(3).is_ok());
-        assert_eq!(buffer.pop(), Some(1));
-        assert_eq!(buffer.pop(), Some(2));
-        assert_eq!(buffer.pop(), Some(3));
-        assert_eq!(buffer.pop(), None);
+        assert!(buffer.try_push(1).is_ok());
+        assert!(buffer.try_push(2).is_ok());
+        assert!(buffer.try_push(3).is_ok());
+        assert_eq!(buffer.try_pop(), Some(1));
+        assert_eq!(buffer.try_pop(), Some(2));
+        assert_eq!(buffer.try_pop(), Some(3));
+        assert_eq!(buffer.try_pop(), None);
     }
 
     #[test]
     fn test_full_buffer() {
         let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
-        assert!(buffer.push(1).is_ok());
-        assert!(buffer.push(2).is_ok());
-        assert!(buffer.push(3).is_ok());
-        assert!(buffer.push(4).is_err()); // Buffer should be full
-        assert_eq!(buffer.pop(), Some(1));
-        assert!(buffer.push(4).is_ok()); // Now there should be space
+        assert!(buffer.try_push(1).is_ok());
+        assert!(buffer.try_push(2).is_ok());
+        assert!(buffer.try_push(3).is_ok());
+        assert!(buffer.try_push(4).is_err()); // Buffer should be full
+        assert_eq!(buffer.try_pop(), Some(1));
+        assert!(buffer.try_push(4).is_ok()); // Now there should be space
     }
 
     #[test]
     fn test_wraparound() {
         let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
-        assert!(buffer.push(1).is_ok());
-        assert!(buffer.push(2).is_ok());
-        assert!(buffer.push(3).is_ok());
-        assert!(buffer.push(4).is_err()); // Buffer is full
-        assert_eq!(buffer.pop(), Some(1));
-        assert!(buffer.push(4).is_ok());
-        assert_eq!(buffer.pop(), Some(2));
-        assert_eq!(buffer.pop(), Some(3));
-        assert_eq!(buffer.pop(), Some(4));
-        assert_eq!(buffer.pop(), None);
+        assert!(buffer.try_push(1).is_ok());
+        assert!(buffer.try_push(2).is_ok());
+        assert!(buffer.try_push(3).is_ok());
+        assert!(buffer.try_push(4).is_err()); // Buffer is full
+        assert_eq!(buffer.try_pop(), Some(1));
+        assert!(buffer.try_push(4).is_ok());
+        assert_eq!(buffer.try_pop(), Some(2));
+        assert_eq!(buffer.try_pop(), Some(3));
+        assert_eq!(buffer.try_pop(), Some(4));
+        assert_eq!(buffer.try_pop(), None);
     }
 
     #[test]
     fn test_peek() {
         let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
         assert_eq!(buffer.peek(), None);
-        assert!(buffer.push(1).is_ok());
+        assert!(buffer.try_push(1).is_ok());
         assert_eq!(buffer.peek(), Some(&1));
         assert_eq!(buffer.peek(), Some(&1)); // Peek shouldn't consume
-        assert_eq!(buffer.pop(), Some(1));
+        assert_eq!(buffer.try_pop(), Some(1));
         assert_eq!(buffer.peek(), None);
     }
 
@@ -1587,51 +1656,51 @@ mod tests {
     fn test_len() {
         let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
         assert_eq!(buffer.len(), 0);
-        assert!(buffer.push(1).is_ok());
+        assert!(buffer.try_push(1).is_ok());
         assert_eq!(buffer.len(), 1);
-        assert!(buffer.push(2).is_ok());
+        assert!(buffer.try_push(2).is_ok());
         assert_eq!(buffer.len(), 2);
-        assert_eq!(buffer.pop(), Some(1));
+        assert_eq!(buffer.try_pop(), Some(1));
         assert_eq!(buffer.len(), 1);
-        assert_eq!(buffer.pop(), Some(2));
+        assert_eq!(buffer.try_pop(), Some(2));
         assert_eq!(buffer.len(), 0);
     }
 
     #[test]
     fn test_clear() {
         let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
-        assert!(buffer.push(1).is_ok());
-        assert!(buffer.push(2).is_ok());
+        assert!(buffer.try_push(1).is_ok());
+        assert!(buffer.try_push(2).is_ok());
         buffer.clear();
         assert_eq!(buffer.len(), 0);
-        assert_eq!(buffer.pop(), None);
-        assert!(buffer.push(3).is_ok());
-        assert_eq!(buffer.pop(), Some(3));
+        assert_eq!(buffer.try_pop(), None);
+        assert!(buffer.try_push(3).is_ok());
+        assert_eq!(buffer.try_pop(), Some(3));
     }
 
     #[test]
     fn test_multiple_wraparounds() {
         let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
         for i in 0..10 {
-            assert!(buffer.push(i).is_ok());
+            assert!(buffer.try_push(i).is_ok());
             if i >= 2 {
                 // Buffer can only hold 3 elements (N-1)
-                assert_eq!(buffer.pop(), Some(i - 2));
+                assert_eq!(buffer.try_pop(), Some(i - 2));
             }
         }
-        assert_eq!(buffer.pop(), Some(8));
-        assert_eq!(buffer.pop(), Some(9));
-        assert_eq!(buffer.pop(), None);
+        assert_eq!(buffer.try_pop(), Some(8));
+        assert_eq!(buffer.try_pop(), Some(9));
+        assert_eq!(buffer.try_pop(), None);
     }
 
     #[test]
     fn test_alternating_push_pop() {
         let buffer: AtomicRingBuffer<u32, 4> = AtomicRingBuffer::new();
         for i in 0..100 {
-            assert!(buffer.push(i).is_ok());
-            assert_eq!(buffer.pop(), Some(i));
+            assert!(buffer.try_push(i).is_ok());
+            assert_eq!(buffer.try_pop(), Some(i));
         }
-        assert_eq!(buffer.pop(), None);
+        assert_eq!(buffer.try_pop(), None);
     }
 
     #[test]

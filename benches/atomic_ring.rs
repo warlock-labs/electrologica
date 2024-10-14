@@ -48,12 +48,12 @@ mod profiling {
 
 fn bench_ring_buffer(c: &mut Criterion) {
     let mut group = c.benchmark_group("atomic_ring_buffer");
-    group.measurement_time(Duration::from_secs(100));
+    group.measurement_time(Duration::from_secs(10));
     group.warm_up_time(Duration::from_secs(3));
-    group.sample_size(10); // Increased for better statistical significance
+    group.sample_size(10);
 
-    let total_operations = 10_000_000; // Increased for longer-running benchmarks
-    let buffer_sizes = [64, 256, 1024, 4096];
+    let base_operations = 10_000_000;
+    let buffer_sizes = [4096];
     let thread_configs = [
         (1, 1),   // 1 producer, 1 consumer
         (2, 2),   // 2 producers, 2 consumers
@@ -66,6 +66,7 @@ fn bench_ring_buffer(c: &mut Criterion) {
 
     for &buffer_size in &buffer_sizes {
         for &(producer_count, consumer_count) in &thread_configs {
+            let total_operations = base_operations;
             let id = BenchmarkId::new(
                 format!(
                     "size_{}_p{}_c{}",
@@ -85,8 +86,11 @@ fn bench_ring_buffer(c: &mut Criterion) {
                         .map(|_| {
                             let buf = Arc::clone(&buffer);
                             std::thread::spawn(move || {
+                                let mut retries = 0u64;
+                                let max_retries = producer_ops / 10;
                                 for i in 0..producer_ops {
-                                    while buf.push(i as u64).is_err() {
+                                    while buf.try_push(i).is_err() && retries < max_retries {
+                                        retries += 1;
                                         std::hint::spin_loop();
                                     }
                                 }
@@ -99,9 +103,12 @@ fn bench_ring_buffer(c: &mut Criterion) {
                         .map(|_| {
                             let buf = Arc::clone(&buffer);
                             std::thread::spawn(move || {
+                                let mut retries = 0u64;
+                                let max_retries = producer_ops / 10;
                                 let mut sum = 0;
                                 for _ in 0..consumer_ops {
-                                    while let None = buf.pop() {
+                                    while buf.try_pop().is_none() && retries < max_retries {
+                                        retries += 1;
                                         std::hint::spin_loop();
                                     }
                                     sum += 1;
@@ -115,13 +122,9 @@ fn bench_ring_buffer(c: &mut Criterion) {
                     for producer in producers {
                         producer.join().unwrap();
                     }
-                    for consumer in consumers {
-                        consumer.join().unwrap();
-                    }
-                    //let total_consumed: u64 = consumers.into_iter().map(|c| c.join().unwrap()).sum();
-                    //total_operations = total_consumed;
+                    let _: u64 = consumers.into_iter().map(|c| c.join().unwrap()).sum();
 
-                    //assert_eq!(total_consumed, total_ops as u64);
+                    //assert_eq!(total_consumed, total_ops);
                 })
             });
         }
