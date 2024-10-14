@@ -1250,7 +1250,7 @@ impl<'a, T: Send + Sync, const N: usize> ParallelIterator for ParIter<'a, T, N> 
 }
 
 #[cfg(feature = "rayon")]
-impl<'a, T: Send + Sync, const N: usize> IndexedParallelIterator for ParIter<'a, T, N> {
+impl<T: Send + Sync, const N: usize> IndexedParallelIterator for ParIter<'_, T, N> {
     fn len(&self) -> usize {
         self.buffer.len()
     }
@@ -1350,14 +1350,14 @@ impl<'a, T: Send + Sync, const N: usize> Iterator for ParIterProducerIter<'a, T,
 }
 
 #[cfg(feature = "rayon")]
-impl<'a, T: Send + Sync, const N: usize> ExactSizeIterator for ParIterProducerIter<'a, T, N> {
+impl<T: Send + Sync, const N: usize> ExactSizeIterator for ParIterProducerIter<'_, T, N> {
     fn len(&self) -> usize {
         self.size_hint().0
     }
 }
 
 #[cfg(feature = "rayon")]
-impl<'a, T: Send + Sync, const N: usize> DoubleEndedIterator for ParIterProducerIter<'a, T, N> {
+impl<T: Send + Sync, const N: usize> DoubleEndedIterator for ParIterProducerIter<'_, T, N> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.current == self.end {
             return None;
@@ -1477,7 +1477,7 @@ pub struct ParDrain<'a, T: Send + Sync, const N: usize> {
 }
 
 #[cfg(feature = "rayon")]
-impl<'a, T: Send + Sync, const N: usize> ParallelIterator for ParDrain<'a, T, N> {
+impl<T: Send + Sync, const N: usize> ParallelIterator for ParDrain<'_, T, N> {
     type Item = T;
 
     fn drive_unindexed<C>(self, consumer: C) -> C::Result
@@ -1493,7 +1493,7 @@ impl<'a, T: Send + Sync, const N: usize> ParallelIterator for ParDrain<'a, T, N>
 }
 
 #[cfg(feature = "rayon")]
-impl<'a, T: Send + Sync, const N: usize> IndexedParallelIterator for ParDrain<'a, T, N> {
+impl<T: Send + Sync, const N: usize> IndexedParallelIterator for ParDrain<'_, T, N> {
     fn len(&self) -> usize {
         self.buffer.len()
     }
@@ -1557,7 +1557,7 @@ struct ParDrainIter<'a, T: Send, const N: usize> {
 }
 
 #[cfg(feature = "rayon")]
-impl<'a, T: Send, const N: usize> Iterator for ParDrainIter<'a, T, N> {
+impl<T: Send, const N: usize> Iterator for ParDrainIter<'_, T, N> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1576,7 +1576,7 @@ impl<'a, T: Send, const N: usize> Iterator for ParDrainIter<'a, T, N> {
 }
 
 #[cfg(feature = "rayon")]
-impl<'a, T: Send, const N: usize> ExactSizeIterator for ParDrainIter<'a, T, N> {
+impl<T: Send, const N: usize> ExactSizeIterator for ParDrainIter<'_, T, N> {
     fn len(&self) -> usize {
         self.end - self.current
     }
@@ -1584,7 +1584,7 @@ impl<'a, T: Send, const N: usize> ExactSizeIterator for ParDrainIter<'a, T, N> {
 
 /// TODO(This is some trait abuse required to satify the compiler)
 #[cfg(feature = "rayon")]
-impl<'a, T: Send, const N: usize> DoubleEndedIterator for ParDrainIter<'a, T, N> {
+impl<T: Send, const N: usize> DoubleEndedIterator for ParDrainIter<'_, T, N> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.current < self.end {
             self.end -= 1;
@@ -1783,7 +1783,7 @@ mod tests {
         });
 
         producer_thread.join().unwrap();
-        let sum = consumer_thread.join().unwrap();
+        let _ = consumer_thread.join().unwrap();
         // We expect some losses here based on the test just firing off and forgetting
         // the producer thread, but the sum should be close to the expected value
         //assert!(sum >= (0..1000000).sum::<u64>() - 100000);
