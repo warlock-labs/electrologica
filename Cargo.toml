@@ -15,6 +15,10 @@ description = "High performance concurrent primitives for Rust."
 tikv-jemallocator = { version = "0.6", optional = true }
 
 [[bench]]
+name = "atomic_ring"
+harness = false
+
+[[bench]]
 name = "rayon_atomic_semaphore"
 harness = false
 
@@ -22,7 +26,9 @@ harness = false
 path = "src/lib.rs"
 
 [dependencies]
+crossbeam-utils = "0.8.20"
 pprof = { version = "0.13.0", features = ["flamegraph"], optional = true }
+rayon = { version = "1.5.1", optional = true}
 
 
 [dev-dependencies]
@@ -38,5 +44,8 @@ approx = "0.5.1"
 
 [features]
 default = []
-jemalloc = ["tikv-jemallocator"]
-dev-profiling = ["pprof"]
+
+[package.metadata.docs.rs]
+rayon = ["dep:rayon"]
+dev-profiling = ["dep:pprof"]
+jemalloc = ["dep:tikv-jemallocator"]
