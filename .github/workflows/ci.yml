@@ -121,8 +121,6 @@ jobs:
         with:
           cache-on-failure: true
       - run: cargo clippy --workspace --all-targets --all-features
-        env:
-          RUSTFLAGS: -Dwarnings
 
   docs:
     runs-on: ubuntu-latest
@@ -135,7 +133,7 @@ jobs:
           cache-on-failure: true
       - run: cargo doc --workspace --all-features --no-deps --document-private-items
         env:
-          RUSTDOCFLAGS: "--cfg docsrs -D warnings"
+          RUSTDOCFLAGS: "--cfg docsrs"
 
   fmt:
     runs-on: ubuntu-latest

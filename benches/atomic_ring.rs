@@ -74,7 +74,7 @@ fn bench_ring_buffer(c: &mut Criterion) {
                 ),
                 total_operations,
             );
-            group.throughput(Throughput::Elements(total_operations as u64));
+            group.throughput(Throughput::Elements(total_operations));
             group.bench_with_input(id, &total_operations, |b, &total_ops| {
                 b.iter(|| {
                     let buffer = Arc::new(AtomicRingBuffer::<u64, 4096>::new());
