@@ -1,3 +1,5 @@
+![Logo](./electrologica.png)
+
 # Electrologica
 
 [![License](https://img.shields.io/crates/l/electrologica)](https://choosealicense.com/licenses/apache-2.0/)
